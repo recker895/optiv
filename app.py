@@ -1,44 +1,9 @@
 import re
 from io import BytesIO
-from pathlib import Path
 import streamlit as st
 import pandas as pd
 
-# Lazy imports (so Streamlit starts fast)
-def _easyocr_text(file_bytes: bytes) -> str:
-    import easyocr
-    import tempfile, os
-    # EasyOCR expects a path; write temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        path = tmp.name
-    try:
-        reader = easyocr.Reader(["en"], verbose=False)
-        out = reader.readtext(path, detail=0)
-        return " ".join(out)
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-
-def _pdf_text(file_bytes: bytes) -> str:
-    from PyPDF2 import PdfReader
-    import io
-    reader = PdfReader(io.BytesIO(file_bytes))
-    parts = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    return "\n".join(parts)
-
-def _plain_text(file_bytes: bytes) -> str:
-    try:
-        return file_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-# --- Controls (regex rules) ---
+# ---------- Controls (regex rules) ----------
 CONTROLS = {
     "data_destruction": [
         r"certificate of data destruction",
@@ -60,23 +25,66 @@ CONTROLS = {
     "iam_least_privilege": [r"action.*s3:get\*", r"action.*s3:list\*"],
 }
 FAIL_PATTERNS = {
-    "iam_least_privilege": [r"action.*\*.*resource.*\*"],  # overly broad
+    "iam_least_privilege": [r"action.*\*.*resource.*\*"],  # overly-broad IAM
 }
 
+# ---------- Helpers ----------
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").lower()
 
-def extract_text(uploaded_file) -> str:
-    name = uploaded_file.name.lower()
-    data = uploaded_file.read()
-    # Route by extension
+@st.cache_resource
+def get_easyocr_reader():
+    """Create once-per-session. If EasyOCR/torch not available, return None."""
+    try:
+        import easyocr
+        return easyocr.Reader(["en"], verbose=False)
+    except Exception:
+        return None
+
+def extract_text(file) -> str:
+    """Route by extension and extract text (OCR for images, PyPDF2 for PDFs, plain decode for others)."""
+    name = (file.name or "").lower()
+
+    # Read raw bytes once
+    data = file.read()
+    file.seek(0)
+
+    # Images → EasyOCR (if available)
     if name.endswith((".png", ".jpg", ".jpeg")):
-        return _easyocr_text(data)
-    elif name.endswith(".pdf"):
-        return _pdf_text(data)
-    else:
-        # try plain text (txt, json, log, csv…)
-        return _plain_text(data)
+        reader = get_easyocr_reader()
+        if reader is None:
+            st.warning("EasyOCR unavailable. Install `easyocr torch torchvision` in requirements.txt to OCR images.")
+            return ""
+        # EasyOCR expects a filepath; write a small temp file
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            path = tmp.name
+        try:
+            out = reader.readtext(path, detail=0)
+            return " ".join(out)
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+
+    # PDFs → PyPDF2
+    if name.endswith(".pdf"):
+        try:
+            from PyPDF2 import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(data))
+            parts = [(p.extract_text() or "") for p in reader.pages]
+            return "\n".join(parts)
+        except Exception:
+            st.warning("PyPDF2 not available or failed to read this PDF.")
+            return ""
+
+    # Plain text (txt/log/json/csv…)
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 def evaluate(text: str) -> dict:
     t = normalize(text)
@@ -88,66 +96,61 @@ def evaluate(text: str) -> dict:
         out[ctrl] = {"status": status, "matches": hits + fails}
     return out
 
-def build_results_df(results_by_file):
+def results_to_dataframe(results_by_file: dict) -> pd.DataFrame:
     rows = []
     for fname, res in results_by_file.items():
         row = {"file": fname}
         for ctrl, outcome in res.items():
-            row[f"{ctrl}_status"] = outcome["status"]
+            row[f"{ctrl}_status"]  = outcome["status"]
             row[f"{ctrl}_matches"] = "; ".join(outcome["matches"])
         rows.append(row)
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
-# ---- UI ----
-st.set_page_config(page_title="Control Checker", page_icon="🔍", layout="centered")
-st.title("🔍 Security Control Checker (OCR + Rules)")
-
+# ---------- UI ----------
+st.set_page_config(page_title="Security Control Checker", page_icon="🔎", layout="centered")
+st.title("🔎 Security Control Checker")
 st.write(
-    "Upload **image/PDF/log/JSON/TXT** evidence. We'll extract text (EasyOCR/PyPDF2/plain), "
-    "then check against common security controls and let you download an Excel of results."
+    "Upload **images/PDFs/TXT/JSON/LOG/CSV** → we extract text (OCR for images, PDF parser for PDFs), "
+    "match against rules, and let you **download an Excel** of results."
 )
 
 uploads = st.file_uploader(
-    "Upload one or more files",
-    type=["png", "jpg", "jpeg", "pdf", "txt", "log", "json", "csv"],
+    "Upload one or more evidence files",
+    type=["png","jpg","jpeg","pdf","txt","log","json","csv"],
     accept_multiple_files=True,
 )
 
+# Optional toggle: show OCR/text preview
+show_preview = st.checkbox("Show extracted text preview (first 1000 chars)", value=False)
+
 if uploads:
-    results_by_file = {}
-    with st.spinner("Processing..."):
-        for uf in uploads:
-            st.subheader(f"📄 {uf.name}")
-            try:
-                text = extract_text(uf)
-            finally:
-                uf.seek(0)  # reset after read so Streamlit keeps it accessible
+    results = {}
+    for uf in uploads:
+        with st.spinner(f"Processing: {uf.name}"):
+            text = extract_text(uf)
 
-            if not text.strip():
-                st.warning("No text extracted — for images install `easyocr torch torchvision`; for PDFs install `PyPDF2`.")
-                continue
+        if not text.strip():
+            st.warning(f"No text extracted from: {uf.name}")
+            continue
 
-            # show OCR/Extract preview
-            st.text_area("Extracted Text (preview)", text[:1000], height=200)
+        if show_preview:
+            st.text_area(f"Extracted text preview — {uf.name}", text[:1000], height=180)
 
-            res = evaluate(text)
-            results_by_file[uf.name] = res
+        res = evaluate(text)
+        results[uf.name] = res
 
-            # show status per control
-            for ctrl, outcome in res.items():
-                status = outcome["status"]
-                matches = ", ".join(outcome["matches"]) or "—"
-                if status == "COMPLIANT":
-                    st.success(f"{ctrl}: {status}  •  {matches}")
-                elif status == "NON_COMPLIANT":
-                    st.error(f"{ctrl}: {status}  •  {matches}")
-                else:
-                    st.info(f"{ctrl}: {status}  •  {matches}")
+        # Per-file status summary
+        cols = st.columns(3)
+        compliant = sum(1 for r in res.values() if r["status"] == "COMPLIANT")
+        noncomp  = sum(1 for r in res.values() if r["status"] == "NON_COMPLIANT")
+        insuff   = sum(1 for r in res.values() if r["status"] == "INSUFFICIENT_EVIDENCE")
+        cols[0].success(f"✅ Compliant: {compliant}")
+        cols[1].error(f"❌ Non-compliant: {noncomp}")
+        cols[2].info(f"ℹ️ Insufficient: {insuff}")
 
-    if results_by_file:
-        df = build_results_df(results_by_file)
-        st.subheader("📊 Results Table")
+    if results:
+        df = results_to_dataframe(results)
+        st.subheader("📊 Results")
         st.dataframe(df, use_container_width=True)
 
         # Excel download
@@ -155,10 +158,10 @@ if uploads:
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="results")
         st.download_button(
-            label="⬇️ Download results.xlsx",
+            "⬇️ Download results.xlsx",
             data=buf.getvalue(),
             file_name="results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-st.caption("Tip: For best OCR on screenshots, crop tightly and ensure readable resolution.")
+st.caption("Tip: On Streamlit Cloud, include `easyocr`, `torch`, `torchvision`, `PyPDF2`, `pandas`, and `openpyxl` in requirements.txt.")
